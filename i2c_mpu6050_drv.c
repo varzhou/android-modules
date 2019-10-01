@@ -145,7 +145,7 @@ static irqreturn_t mpu6050_handler_isr(int irq, void *regs){
 
 	disable_irq_nosync(g_gsnsr_data.irq);
 	schedule_work(&g_gsnsr_data.work);
-	return 0;
+	return IRQ_HANDLED ;
 }
 
 static void gsensor_data_irq_work(struct work_struct *work) {
