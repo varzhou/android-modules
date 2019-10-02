@@ -31,35 +31,39 @@ struct gsnsr_data_t{
 
 static struct gsnsr_data_t g_gsnsr_data;
 
-static ssize_t enable_sensor(struct device *device, struct device_attribute *attr,
+static ssize_t show_enable_sensor(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
 		
 	return 0;
 }
 		
-static ssize_t set_sensortime(struct device *device, struct device_attribute *attr,
+static ssize_t show_set_sensortime(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
 		 
 	return 0;
 }
 
+static ssize_t show_get_mpu_data(struct device *device, struct device_attribute *attr,
+											const char *buf, size_t count){
+	return 0;
+}
 
-static DEVICE_ATTR(enable_sensor, 0644, NULL, enable_sensor);
-static DEVICE_ATTR(set_sensortime, 0644, NULL, set_sensortime);
 
+static DEVICE_ATTR(enable_sensor, 0644, NULL, show_enable_sensor);
+static DEVICE_ATTR(set_sensortime, 0644, NULL, show_set_sensortime);
+static DEVICE_ATTR(get_mpu_data, 0644, NULL, show_get_mpu_data);
 
 static struct attribute *mpu605x_input_sysfs_entries[] = {
 	&dev_attr_enable_sensor.attr,
 	&dev_attr_set_sensortime.attr,
+	&dev_attr_get_mpu_data.attr,
 	NULL
 };
 
 
 static struct attribute_group mpu605x_input_attr_group = {
-	.name = "mpu6050",
 	.attrs	= mpu605x_input_sysfs_entries,
 };
-
 
 static int mpu6050_writereg(const struct i2c_client *cli,u8 reg_add,u8 reg_dat)
 {
@@ -110,7 +114,7 @@ static int gsnsr_bsp_Initlation(struct i2c_client *cli,struct gsnsr_platform_dat
 		printk("is not support this devices and id = %d\n",chipid);
 		return -ENODEV;
 	}
-	mpu6050_writereg(cli,MPU_SAMPLE_RATE_REG,20 );  //陀螺仪采样率  
+	mpu6050_writereg(cli,MPU_SAMPLE_RATE_REG,20);  //陀螺仪采样率 50HZ 
     mpu6050_writereg(cli,MPU_CFG_REG,0x06 );            
 	
     mpu6050_writereg(cli,MPU_GYRO_CFG_REG,(3<<3));   
@@ -152,7 +156,7 @@ static void gsensor_data_irq_work(struct work_struct *work) {
 	u8 sta = 0;
 	u16 ax = 0,ay = 0,az = 0;
 	sta = i2c_smbus_read_byte_data(g_gsnsr_data.client,MPU_INT_STA_REG);
-	printk("gsensor_data_irq_work %d\n",sta);
+	//printk("gsensor_data_irq_work %d\n",sta);
 	if(sta & 0x01){
 		mpu_get_accelerometer(g_gsnsr_data.client,&ax,&ay,&az);
 		printk("get mpu6050 data x = %d y = %d z = %d\n",ax,ay,az);
@@ -177,6 +181,7 @@ static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id 
 	}
 	g_gsnsr_data.client = cli;
 	g_gsnsr_data.input_dev = input_allocate_device();
+	g_gsnsr_data.input_dev->name = "mpu605x";
 	if(NULL == g_gsnsr_data.input_dev){
 		printk("input_allocate_device fail\n");
 		return -ENODEV;
@@ -188,6 +193,12 @@ static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id 
 	}
 	g_gsnsr_data.irq = info->irq;
 	if(0 != gsnsr_bsp_Initlation(cli,info)){
+		goto skip_alloc;
+	}
+	
+	ret = sysfs_create_group(&cli->dev.kobj, &mpu605x_input_attr_group);
+	if (ret) {
+		dev_err(&cli->dev, "create sysfs group failed!\n");
 		goto skip_alloc;
 	}
 	INIT_WORK(&g_gsnsr_data.work, gsensor_data_irq_work);
