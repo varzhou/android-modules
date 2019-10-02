@@ -21,6 +21,9 @@ struct gsnsr_data_t{
 	int ax;
 	int ay;
 	int az;
+	bool data_flag;
+	bool switch_flag;
+	unsigned int tim_val;
 	struct work_struct work;
 	struct i2c_client *client;
 };
@@ -33,25 +36,32 @@ static struct gsnsr_data_t g_gsnsr_data;
 
 static ssize_t show_enable_sensor(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
-		
+	char tbuf[12] = {0};
+	strcpy(tbuf,buf);
+	sscanf(tbuf,"%d",&g_gsnsr_data.switch_flag);
 	return 0;
 }
 		
 static ssize_t show_set_sensortime(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
-		 
+	char tbuf[12] = {0};
+	strcpy(tbuf,buf);
+	sscanf(tbuf,"%d",&g_gsnsr_data.tim_val);
 	return 0;
 }
 
 static ssize_t show_get_mpu_data(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
+	if(true == g_gsnsr_data.data_flag){
+		return sprintf(buf,"%3d,%3d,%3d",g_gsnsr_data.ax,g_gsnsr_data.ay,g_gsnsr_data.az);
+	}
 	return 0;
 }
 
 
 static DEVICE_ATTR(enable_sensor, 0644, NULL, show_enable_sensor);
 static DEVICE_ATTR(set_sensortime, 0644, NULL, show_set_sensortime);
-static DEVICE_ATTR(get_mpu_data, 0644, NULL, show_get_mpu_data);
+static DEVICE_ATTR(get_mpu_data, 0644, show_get_mpu_data,NULL);
 
 static struct attribute *mpu605x_input_sysfs_entries[] = {
 	&dev_attr_enable_sensor.attr,
@@ -115,7 +125,7 @@ static int gsnsr_bsp_Initlation(struct i2c_client *cli,struct gsnsr_platform_dat
 		return -ENODEV;
 	}
 	mpu6050_writereg(cli,MPU_SAMPLE_RATE_REG,20);  //陀螺仪采样率 50HZ 
-    mpu6050_writereg(cli,MPU_CFG_REG,0x06 );            
+    mpu6050_writereg(cli,MPU_CFG_REG,0x06);            
 	
     mpu6050_writereg(cli,MPU_GYRO_CFG_REG,(3<<3));   
     mpu6050_writereg(cli,MPU_ACCEL_CFG_REG,0 );   	//配置加速度传感器工作在16G模式  
@@ -164,6 +174,7 @@ static void gsensor_data_irq_work(struct work_struct *work) {
 		input_report_abs(g_gsnsr_data.input_dev, ABS_Y, ay);
 		input_report_abs(g_gsnsr_data.input_dev, ABS_Z, az);
 		input_sync(g_gsnsr_data.input_dev);
+		g_gsnsr_data.data_flag = true;
 	}
 	enable_irq(g_gsnsr_data.irq);
 }
