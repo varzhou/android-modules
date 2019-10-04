@@ -8,12 +8,15 @@
 #include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/device.h>
+#include <linux/ktime.h>
 
 #include <linux/gpio.h>
 #include <linux/i2c.h>
 #include <linux/irq.h>
 
 #include <linux/sensor/gsnsr_reg.h>
+
+#define CONFIG_MPU605X_POLL	(1)
 
 struct gsnsr_data_t{
 	struct input_dev *input_dev;
@@ -22,11 +25,24 @@ struct gsnsr_data_t{
 	int ay;
 	int az;
 	bool data_flag;
-	bool switch_flag;
+	atomic_t enabled;
 	unsigned int tim_val;
+	int64_t timestamp;
+	
+	ktime_t ktime;
+	struct hrtimer hr_timer;
 	struct work_struct work;
 	struct i2c_client *client;
 };
+
+static inline int64_t mpu605x_acc_get_time_ns(void)
+{
+	struct timespec ts;
+
+	get_monotonic_boottime(&ts);
+
+	return timespec_to_ns(&ts);
+}
 
 /*
 **	、注册sensor的输入子系统
@@ -38,15 +54,17 @@ static ssize_t show_enable_sensor(struct device *device, struct device_attribute
 											const char *buf, size_t count){
 	char tbuf[12] = {0};
 	strcpy(tbuf,buf);
-	sscanf(tbuf,"%d",&g_gsnsr_data.switch_flag);
+	//sscanf(tbuf,"%d",&g_gsnsr_data.switch_flag);
+	printk("enable sensor sta = %s",tbuf);
 	return 0;
 }
 		
-static ssize_t show_set_sensortime(struct device *device, struct device_attribute *attr,
+static ssize_t show_set_sensordelay(struct device *device, struct device_attribute *attr,
 											const char *buf, size_t count){
 	char tbuf[12] = {0};
 	strcpy(tbuf,buf);
 	sscanf(tbuf,"%d",&g_gsnsr_data.tim_val);
+	printk("show_set_sensortime tim_val = %s",tbuf);
 	return 0;
 }
 
@@ -60,12 +78,12 @@ static ssize_t show_get_mpu_data(struct device *device, struct device_attribute 
 
 
 static DEVICE_ATTR(enable_sensor, 0644, NULL, show_enable_sensor);
-static DEVICE_ATTR(set_sensortime, 0644, NULL, show_set_sensortime);
+static DEVICE_ATTR(set_sensordelay, 0644, NULL, show_set_sensordelay);
 static DEVICE_ATTR(get_mpu_data, 0644, show_get_mpu_data,NULL);
 
 static struct attribute *mpu605x_input_sysfs_entries[] = {
 	&dev_attr_enable_sensor.attr,
-	&dev_attr_set_sensortime.attr,
+	&dev_attr_set_sensordelay.attr,
 	&dev_attr_get_mpu_data.attr,
 	NULL
 };
@@ -78,6 +96,21 @@ static struct attribute_group mpu605x_input_attr_group = {
 static int mpu6050_writereg(const struct i2c_client *cli,u8 reg_add,u8 reg_dat)
 {
 	return i2c_smbus_write_byte_data(cli, reg_dat, reg_add);
+}
+
+static unsigned int  mpu605x_read_bytes(struct i2c_client *client,u8 cmd,u8 *data,int len){
+	struct i2c_msg msg[2];
+	msg[0].addr = 0x68;
+	msg[0].buf = &cmd;
+	msg[0].len = 1;
+	msg[0].flags = 0;
+
+	msg[1].addr = 0x68;
+	msg[1].buf = data;
+	msg[1].len = len;
+	msg[1].flags = I2C_M_RD;
+	
+	return i2c_transfer(client->adapter,msg,2);
 }
 
 
@@ -124,28 +157,39 @@ static int gsnsr_bsp_Initlation(struct i2c_client *cli,struct gsnsr_platform_dat
 		printk("is not support this devices and id = %d\n",chipid);
 		return -ENODEV;
 	}
+#if (1 == CONFIG_MPU605X_POLL)
+	mpu6050_writereg(cli,MPU_PWR_MGMT1_REG, 0x00);	     //解除休眠状态
+	mpu6050_writereg(cli,MPU_SAMPLE_RATE_REG , 0x07);	    //陀螺仪采样率
+	mpu6050_writereg(cli,MPU_CFG_REG , 0x06);	
+	mpu6050_writereg(cli,MPU_ACCEL_CFG_REG , 0x01);	  //配置加速度传感器工作在16G模式
+	mpu6050_writereg(cli,MPU_GYRO_CFG_REG, 0x18);     //陀螺仪自检及测量范围，典型值：0x18
+#else
 	mpu6050_writereg(cli,MPU_SAMPLE_RATE_REG,20);  //陀螺仪采样率 50HZ 
-    mpu6050_writereg(cli,MPU_CFG_REG,0x06);            
-	
-    mpu6050_writereg(cli,MPU_GYRO_CFG_REG,(3<<3));   
-    mpu6050_writereg(cli,MPU_ACCEL_CFG_REG,0 );   	//配置加速度传感器工作在16G模式  
-    
-	mpu6050_writereg(cli,MPU_FIFO_EN_REG,0X00);		//关闭FIFO
+	mpu6050_writereg(cli,MPU_CFG_REG,0x06); 		   
+
+	mpu6050_writereg(cli,MPU_GYRO_CFG_REG,(3<<3));	 
+	mpu6050_writereg(cli,MPU_ACCEL_CFG_REG,0 ); 	//配置加速度传感器工作在16G模式  
+
+	mpu6050_writereg(cli,MPU_FIFO_EN_REG,0X00); 	//关闭FIFO
 	mpu6050_writereg(cli,MPU_USER_CTRL_REG,0X00);	//I2C主模式关闭
-	
-    mpu6050_writereg(cli,MPU_GYRO_CFG_REG,0x18);    //陀螺仪自检及测量范围，典型值：0x18(不自检，2000deg/s)  
-	
+
+	mpu6050_writereg(cli,MPU_GYRO_CFG_REG,0x18);	//陀螺仪自检及测量范围，典型值：0x18(不自检，2000deg/s)	
+
 	mpu6050_writereg(cli,MPU_INTBP_CFG_REG,0x9c);	 //设置为低电平触发
-	mpu6050_writereg(cli,MPU_INT_EN_REG,0x01); 		 //选择为数据中断  
+	mpu6050_writereg(cli,MPU_INT_EN_REG,0x01);		 //选择为数据中断  
+#endif
 	return 0;
 }
+
+
 
 static u8 mpu_get_accelerometer(struct i2c_client *cli,short *ax,short *ay,short *az)
 {
     u8 buf[6];
 	int res = -1;  
-	res = i2c_smbus_read_i2c_block_data(cli, MPU_ACCEL_XOUTH_REG, 6,buf);
-	if(res==0)
+	//res = i2c_smbus_read_i2c_block_data(cli, MPU_ACCEL_XOUTH_REG, 6,buf);
+	res = mpu605x_read_bytes(cli,MPU_ACCEL_XOUTH_REG,buf,6);
+	if(res > 0)
 	{
 		*ax=((u16)buf[0]<<8)|buf[1];  
 		*ay=((u16)buf[2]<<8)|buf[3];  
@@ -155,20 +199,14 @@ static u8 mpu_get_accelerometer(struct i2c_client *cli,short *ax,short *ay,short
 }
 
 
-static irqreturn_t mpu6050_handler_isr(int irq, void *regs){
-
-	disable_irq_nosync(g_gsnsr_data.irq);
-	schedule_work(&g_gsnsr_data.work);
-	return IRQ_HANDLED ;
-}
-
 static void gsensor_data_irq_work(struct work_struct *work) {
 	u8 sta = 0;
 	u16 ax = 0,ay = 0,az = 0;
+	ktime_t tmpkt;
 	sta = i2c_smbus_read_byte_data(g_gsnsr_data.client,MPU_INT_STA_REG);
-	//printk("gsensor_data_irq_work %d\n",sta);
-	if(sta & 0x01){
+	if(sta >= 0){
 		mpu_get_accelerometer(g_gsnsr_data.client,&ax,&ay,&az);
+		
 		printk("get mpu6050 data x = %d y = %d z = %d\n",ax,ay,az);
 		input_report_abs(g_gsnsr_data.input_dev, ABS_X, ax);
 		input_report_abs(g_gsnsr_data.input_dev, ABS_Y, ay);
@@ -176,9 +214,30 @@ static void gsensor_data_irq_work(struct work_struct *work) {
 		input_sync(g_gsnsr_data.input_dev);
 		g_gsnsr_data.data_flag = true;
 	}
+#if	(1 == CONFIG_MPU605X_POLL)
+	tmpkt = ktime_sub(g_gsnsr_data.ktime,
+			  ktime_set(0, 
+			  (mpu605x_acc_get_time_ns() - g_gsnsr_data.timestamp)));
+	hrtimer_start(&g_gsnsr_data.hr_timer, g_gsnsr_data.ktime, HRTIMER_MODE_REL);
+#else
 	enable_irq(g_gsnsr_data.irq);
+#endif
 }
 
+#if (1 == CONFIG_MPU605X_POLL)
+static enum hrtimer_restart mpu605x_acc_poll_function_read(struct hrtimer *timer){
+	g_gsnsr_data.timestamp = mpu605x_acc_get_time_ns();
+	schedule_work(&g_gsnsr_data.work);
+	return HRTIMER_NORESTART;
+}
+#else
+static irqreturn_t mpu6050_handler_isr(int irq, void *regs){
+
+	disable_irq_nosync(g_gsnsr_data.irq);
+	schedule_work(&g_gsnsr_data.work);
+	return IRQ_HANDLED ;
+}
+#endif
 
 static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id *id){
 	int ret = -EINVAL;
@@ -206,7 +265,7 @@ static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id 
 	if(0 != gsnsr_bsp_Initlation(cli,info)){
 		goto skip_alloc;
 	}
-	
+	atomic_set(&g_gsnsr_data.enabled, 0);
 	ret = sysfs_create_group(&cli->dev.kobj, &mpu605x_input_attr_group);
 	if (ret) {
 		dev_err(&cli->dev, "create sysfs group failed!\n");
@@ -224,12 +283,21 @@ static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id 
 	input_set_abs_params(g_gsnsr_data.input_dev, ABS_Z, 0, 0x3FF, 32, 0);
 	
 	g_gsnsr_data.input_dev->name = "MPU605x";
+    g_gsnsr_data.input_dev->phys = "input/mpu605x";
 	g_gsnsr_data.input_dev->id.bustype = BUS_I2C;
 	g_gsnsr_data.input_dev->id.vendor = 0xDEAD;
 	g_gsnsr_data.input_dev->id.product = 0xBEEF;
 	g_gsnsr_data.input_dev->id.version = 0x0102;
-	printk("irq = %d\n",info->irq);
 	
+	printk("irq = %d\n",info->irq);
+	input_set_drvdata(g_gsnsr_data.input_dev, (void *)&g_gsnsr_data);
+	
+#if (1 == CONFIG_MPU605X_POLL)
+	hrtimer_init(&g_gsnsr_data.hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	g_gsnsr_data.hr_timer.function = &mpu605x_acc_poll_function_read;
+	hrtimer_start(&(g_gsnsr_data.hr_timer), g_gsnsr_data.ktime, HRTIMER_MODE_REL);
+	ret = input_register_device(g_gsnsr_data.input_dev);
+#else
 	ret = request_irq(info->irq,mpu6050_handler_isr,
 				IRQF_TRIGGER_LOW,
 				"mpu6050", cli);
@@ -239,6 +307,7 @@ static int gsensor_i2c_probe(struct i2c_client *cli, const struct i2c_device_id 
 	disable_irq(info->irq);
 	ret = input_register_device(g_gsnsr_data.input_dev);
 	enable_irq(info->irq);
+#endif
 	return 0;
 	
 skip_alloc:
@@ -248,6 +317,9 @@ skip_alloc:
 
 static int gsensor_i2c_remove(struct i2c_client *cli){
 	struct gsnsr_platform_data *info = (struct gsnsr_platform_data *)cli->dev.platform_data;
+	
+	input_free_device(g_gsnsr_data.input_dev);
+	input_unregister_device(g_gsnsr_data.input_dev);
 	free_irq(info->irq, NULL);
 	return 0;
 }
